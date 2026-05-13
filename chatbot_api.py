@@ -103,7 +103,7 @@ async def chat(
 
     # ✅ Call Google Gemini API for text processing
     try:
-        model = genai.GenerativeModel("gemini-1.5-pro-latest")
+        model = genai.GenerativeModel("gemini-2.5-flash")
         response = model.generate_content(message)
 
         # ✅ Handle AI response correctly
