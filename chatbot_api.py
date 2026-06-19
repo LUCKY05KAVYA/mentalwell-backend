@@ -1,32 +1,37 @@
 import os
-import re  # ✅ For cleaning AI responses
+import re
 import google.generativeai as genai
-from fastapi import FastAPI, Depends, File, UploadFile, Form
+from fastapi import FastAPI, Depends, File, UploadFile, Form, HTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy import create_engine, Column, Integer, String
 from sqlalchemy.orm import sessionmaker, declarative_base
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 import shutil
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.vectorstores import Chroma
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain.chains import RetrievalQA
+from langchain.prompts import PromptTemplate
 
-app = FastAPI()
+app = FastAPI(title="MentalWell Backend - RAG Enhanced")
 
-# ✅ Enable CORS (for Flutter to communicate with backend)
+# ✅ CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Change "*" to your frontend URL in production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ✅ Database setup (Stores chat history)
+# ✅ Database setup
 DATABASE_URL = "sqlite:///./chat_history.db"
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-# ✅ Chat history model
 class ChatHistory(Base):
     __tablename__ = "chat_history"
     id = Column(Integer, primary_key=True, index=True)
@@ -35,22 +40,43 @@ class ChatHistory(Base):
 
 Base.metadata.create_all(bind=engine)
 
-# ✅ Load Google Gemini API Key
+# ✅ Gemini Setup
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-
 if not GEMINI_API_KEY:
-    raise ValueError("⚠️ Missing API Key! Set GEMINI_API_KEY in your environment.")
+    raise ValueError("⚠️ Missing GEMINI_API_KEY in environment variables.")
 
 genai.configure(api_key=GEMINI_API_KEY)
 
-# ✅ Function to clean AI response
-def clean_response(text):
-    if text:
-        text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)  # Removes **bold**
-        text = re.sub(r"_([^_]+)_", r"\1", text)  # Removes _italic_
-    return text.strip()
+# ✅ RAG Setup
+embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+vectorstore = None
+PERSIST_DIR = "mentalwell_knowledge"
 
-# ✅ Dependency for database session
+def init_rag():
+    global vectorstore
+    if os.path.exists(PERSIST_DIR):
+        vectorstore = Chroma(persist_directory=PERSIST_DIR, embedding_function=embeddings)
+    else:
+        # Initial mental wellness knowledge base
+        sample_docs = [
+            "Cognitive Behavioral Therapy helps identify and change negative thought patterns.",
+            "Practicing mindfulness daily reduces stress and improves emotional regulation.",
+            "Deep breathing exercises can quickly activate the body's relaxation response.",
+            "Regular physical activity releases endorphins and improves mood.",
+            "Journaling helps process emotions and gain clarity on personal challenges.",
+            "Building strong social connections is vital for mental wellbeing.",
+        ]
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=400, chunk_overlap=50)
+        documents = text_splitter.create_documents(sample_docs)
+        
+        vectorstore = Chroma.from_documents(
+            documents=documents,
+            embedding=embeddings,
+            persist_directory=PERSIST_DIR
+        )
+
+init_rag()  # Initialize on startup
+
 def get_db():
     db = SessionLocal()
     try:
@@ -58,72 +84,86 @@ def get_db():
     finally:
         db.close()
 
-# ✅ Folder for image uploads
-UPLOAD_FOLDER = "uploads"
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+def clean_response(text):
+    if text:
+        text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
+        text = re.sub(r"_([^_]+)_", r"\1", text)
+    return text.strip()
 
-# ✅ Chatbot API Endpoint (Handles both text and images)
+class ChatResponse(BaseModel):
+    reply: str
+
+# ✅ Main Chat Endpoint with RAG
 @app.post("/chat/")
 async def chat(
-    message: str = Form(...), 
+    message: str = Form(...),
     image: UploadFile = File(None),
     db: Session = Depends(get_db)
 ):
-    print(f"📥 Received message: {message}")  # Debugging logs
+    try:
+        # Save user message
+        db.add(ChatHistory(role="user", content=message))
+        db.commit()
 
-    # ✅ Save user message to the database
-    db.add(ChatHistory(role="user", content=message))
-    db.commit()
+        # Get recent history
+        chat_history = db.query(ChatHistory).order_by(ChatHistory.id.desc()).limit(6).all()
+        chat_history.reverse()
 
-    # ✅ Retrieve last 5 messages for context
-    chat_history = db.query(ChatHistory).order_by(ChatHistory.id.desc()).limit(5).all()
-    chat_history.reverse()  # Maintain correct order
+        # RAG Retrieval
+        retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
+        relevant_docs = retriever.invoke(message)
+        context = "\n".join([doc.page_content for doc in relevant_docs])
 
-    # ✅ System prompt
-    system_prompt = """
-You are Mindful, a compassionate and empathetic AI mental health assistant.
-- Be warm, supportive, and non-judgmental.
-- Never give medical advice. Always encourage consulting a professional if needed.
-- Keep responses concise (3-6 sentences).
-- Use encouraging and calming language.
+        # Enhanced Prompt with RAG
+        system_prompt = f"""
+You are Mindful, a compassionate mental health companion.
+Use the following context to give warm, helpful, and accurate responses.
+
+Context:
+{context}
+
+Guidelines:
+- Be empathetic and supportive
+- Never give medical diagnosis or treatment advice
+- Encourage professional help when needed
+- Keep responses warm and concise
 """
 
-    # ✅ Add conversation history
-    prompt_text = system_prompt
-    for msg in chat_history:
-        prompt_text += f"{msg.role}: {msg.content}\n"
-    prompt_text += "Assistant:"
+        # Build full prompt
+        prompt_text = system_prompt
+        for msg in chat_history:
+            prompt_text += f"{msg.role.capitalize()}: {msg.content}\n"
+        prompt_text += "Assistant:"
 
-    # ✅ If an image is uploaded, save it
-    image_path = None
-    if image:
-        image_path = os.path.join(UPLOAD_FOLDER, image.filename)
-        with open(image_path, "wb") as buffer:
-            shutil.copyfileobj(image.file, buffer)
-        print(f"✅ Image saved at: {image_path}")
+        # Use Gemini with RAG context
+        model = ChatGoogleGenerativeAI(
+            model="gemini-1.5-flash",
+            google_api_key=GEMINI_API_KEY,
+            temperature=0.7
+        )
 
-    # ✅ Call Google Gemini API for text processing
-    try:
-        model = genai.GenerativeModel("gemini-2.5-flash")
-        response = model.generate_content(message)
+        response = model.invoke(prompt_text)
+        bot_reply = clean_response(response.content)
 
-        # ✅ Handle AI response correctly
-        bot_reply = getattr(response, "text", "⚠️ AI did not generate a response.")
-        bot_reply = clean_response(bot_reply)
-
-        # ✅ Save AI response to chat history
+        # Save AI response
         db.add(ChatHistory(role="assistant", content=bot_reply))
         db.commit()
 
-        print(f"📤 Gemini Response: {bot_reply}")
+        # Handle image if uploaded
+        if image:
+            os.makedirs("uploads", exist_ok=True)
+            image_path = f"uploads/{image.filename}"
+            with open(image_path, "wb") as buffer:
+                shutil.copyfileobj(image.file, buffer)
+
         return {"reply": bot_reply}
 
     except Exception as e:
-        print(f"❌ Google Gemini API Error: {str(e)}")
-        return {"reply": f"⚠️ AI service unavailable: {str(e)}"}
+        print(f"❌ Error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-# ✅ Endpoint to get the last 10 messages
+
 @app.get("/chat-history/")
 async def get_chat_history(db: Session = Depends(get_db)):
-    chat_history = db.query(ChatHistory).order_by(ChatHistory.id.desc()).limit(10).all()
-    return [{"role": record.role, "content": record.content} for record in chat_history]
+    history = db.query(ChatHistory).order_by(ChatHistory.id.desc()).limit(10).all()
+    return [{"role": record.role, "content": record.content} for record in history]
